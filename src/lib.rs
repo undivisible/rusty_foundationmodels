@@ -12,6 +12,8 @@
 //! - **Session-based multi-turn generation** — [`Session::respond`]
 //! - **Streaming** — [`Session::stream`] returns a [`ResponseStream`] that implements
 //!   [`futures_core::Stream`]
+//! - **Structured generation** — [`Session::respond_as`] returns any `serde::Deserialize` type
+//! - **Tool calling** — [`Session::with_tools`] registers Rust closures the model can invoke
 //!
 //! # Requirements
 //!
@@ -47,7 +49,7 @@
 //! # async fn example() -> Result<(), rusty_foundationmodels::Error> {
 //! use rusty_foundationmodels::Session;
 //!
-//! let mut session = Session::with_instructions("You are a concise Rust expert.")?;
+//! let session = Session::with_instructions("You are a concise Rust expert.")?;
 //! let r1 = session.respond("What is ownership?").await?;
 //! let r2 = session.respond("Give me a one-line example.").await?;
 //! println!("{r1}\n{r2}");
@@ -58,15 +60,55 @@
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), rusty_foundationmodels::Error> {
-//! use futures_core::Stream;
 //! use rusty_foundationmodels::Session;
 //!
 //! let session = Session::new()?;
-//! let mut stream = session.stream("Tell me a short story.")?;
+//! let stream = session.stream("Tell me a short story.")?;
+//! # Ok(()) }
+//! ```
 //!
-//! use std::pin::Pin;
-//! use std::task::{Context, Poll, Waker};
-//! // Use your preferred async executor to drive the stream...
+//! # Structured generation
+//!
+//! ```no_run
+//! # async fn example() -> Result<(), rusty_foundationmodels::Error> {
+//! use serde::Deserialize;
+//! use rusty_foundationmodels::{Session, Schema, SchemaProperty, SchemaPropertyType};
+//!
+//! #[derive(Deserialize)]
+//! struct CityInfo { name: String, population: f64, country: String }
+//!
+//! let session = Session::new()?;
+//! let schema = Schema::new("CityInfo")
+//!     .property(SchemaProperty::new("name", SchemaPropertyType::String))
+//!     .property(SchemaProperty::new("population", SchemaPropertyType::Double))
+//!     .property(SchemaProperty::new("country", SchemaPropertyType::String));
+//!
+//! let info: CityInfo = session.respond_as("Describe Paris.", &schema).await?;
+//! println!("{} has {} people", info.name, info.population);
+//! # Ok(()) }
+//! ```
+//!
+//! # Tool calling
+//!
+//! ```no_run
+//! # async fn example() -> Result<(), rusty_foundationmodels::Error> {
+//! use rusty_foundationmodels::{Session, ToolDefinition, Schema, SchemaProperty, SchemaPropertyType};
+//!
+//! let tool = ToolDefinition::new(
+//!     "get_weather",
+//!     "Get current weather for a city",
+//!     Schema::new("GetWeatherArgs")
+//!         .property(SchemaProperty::new("city", SchemaPropertyType::String)
+//!             .description("City name")),
+//!     |args| {
+//!         let city = args["city"].as_str().unwrap_or("unknown");
+//!         Ok(format!("Weather in {city}: sunny, 72°F"))
+//!     },
+//! );
+//!
+//! let session = Session::with_tools("You are a weather assistant.", vec![tool])?;
+//! let response = session.respond("What's the weather in Tokyo?").await?;
+//! println!("{response}");
 //! # Ok(()) }
 //! ```
 //!
@@ -81,6 +123,12 @@ use futures_core::Stream;
 use std::ffi::{CStr, CString, c_char, c_void};
 
 #[cfg(foundation_models_bridge)]
+use std::ptr::null;
+
+#[cfg(foundation_models_bridge)]
+use std::sync::Arc;
+
+#[cfg(foundation_models_bridge)]
 use futures_channel::{mpsc, oneshot};
 
 // ─── FFI declarations ──────────────────────────────────────────────────────────
@@ -89,10 +137,31 @@ use futures_channel::{mpsc, oneshot};
 unsafe extern "C" {
     fn fm_availability_reason() -> i32;
     fn fm_session_create(instructions: *const c_char) -> *mut c_void;
+    fn fm_session_create_with_tools(
+        instructions: *const c_char,
+        tools_json: *const c_char,
+        tool_ctx: *mut c_void,
+        tool_dispatch: extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            *const c_char,
+            *mut c_void,
+            extern "C" fn(*mut c_void, *const c_char, *const c_char),
+        ),
+    ) -> *mut c_void;
     fn fm_session_destroy(handle: *mut c_void);
     fn fm_session_respond(
         handle: *mut c_void,
         prompt: *const c_char,
+        temperature: f64,
+        max_tokens: i64,
+        ctx: *mut c_void,
+        callback: extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    );
+    fn fm_session_respond_structured(
+        handle: *mut c_void,
+        prompt: *const c_char,
+        schema_json: *const c_char,
         temperature: f64,
         max_tokens: i64,
         ctx: *mut c_void,
@@ -146,6 +215,14 @@ pub enum Error {
     /// A `temperature` value outside the valid range [0.0, 2.0] was supplied.
     #[error("temperature {0} is out of range; expected 0.0 – 2.0")]
     InvalidTemperature(f64),
+
+    /// JSON serialisation or deserialisation failed.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// A tool invoked by the model returned an error.
+    #[error("tool '{name}' failed: {message}")]
+    ToolError { name: String, message: String },
 }
 
 // ─── GenerationOptions ─────────────────────────────────────────────────────────
@@ -177,15 +254,170 @@ impl GenerationOptions {
         Ok(())
     }
 
-    /// Raw temperature value for FFI: the temperature if set, otherwise -1.0 (= use default).
     fn ffi_temperature(&self) -> f64 {
         self.temperature.unwrap_or(-1.0)
     }
 
-    /// Raw max-tokens value for FFI: the limit if set, otherwise -1 (= use default).
     fn ffi_max_tokens(&self) -> i64 {
         self.max_tokens.map(|n| n as i64).unwrap_or(-1)
     }
+}
+
+// ─── Schema types for structured generation ────────────────────────────────────
+
+/// The type of a single property in a [`Schema`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaPropertyType {
+    /// UTF-8 text.
+    String,
+    /// Whole number (serialised as JSON integer).
+    Integer,
+    /// Floating-point number.
+    Double,
+    /// Boolean true/false.
+    Bool,
+}
+
+/// A single property within a [`Schema`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaProperty {
+    /// Property name (matches the JSON key in the model output).
+    pub name: String,
+    /// Optional human-readable hint that guides the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The expected type of this property.
+    #[serde(rename = "type")]
+    pub property_type: SchemaPropertyType,
+    /// Whether the model may omit this property.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+impl SchemaProperty {
+    /// Creates a required property with the given name and type.
+    pub fn new(name: impl Into<String>, property_type: SchemaPropertyType) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            property_type,
+            optional: false,
+        }
+    }
+
+    /// Attaches a human-readable description that guides the model.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Marks this property as optional (the model may omit it).
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+}
+
+/// Describes the JSON object shape that the model must produce for structured generation.
+///
+/// Build one using the builder methods, then pass it to [`Session::respond_as`].
+///
+/// ```
+/// use rusty_foundationmodels::{Schema, SchemaProperty, SchemaPropertyType};
+///
+/// let schema = Schema::new("Point")
+///     .property(SchemaProperty::new("x", SchemaPropertyType::Double))
+///     .property(SchemaProperty::new("y", SchemaPropertyType::Double));
+/// ```
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Schema {
+    /// Internal type name used by the model's structured generation system.
+    pub name: String,
+    /// Optional description of what this type represents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The properties the model must populate.
+    pub properties: Vec<SchemaProperty>,
+}
+
+impl Schema {
+    /// Creates a new empty schema with the given type name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            properties: Vec::new(),
+        }
+    }
+
+    /// Attaches a description of this type.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Adds a property to this schema.
+    pub fn property(mut self, property: SchemaProperty) -> Self {
+        self.properties.push(property);
+        self
+    }
+}
+
+// ─── Tool calling ──────────────────────────────────────────────────────────────
+
+/// A function that the model can invoke when responding to a prompt.
+///
+/// The `handler` receives the model's arguments as a [`serde_json::Value`] and must return
+/// either a string result (delivered back to the model) or an error string.
+///
+/// Build one with [`ToolDefinition::new`].
+pub struct ToolDefinition {
+    /// Name the model uses to reference this tool. Must be unique within a session.
+    pub name: String,
+    /// Human-readable description shown to the model.
+    pub description: String,
+    /// Schema describing the arguments the model must supply when calling this tool.
+    pub parameters: Schema,
+    pub(crate) handler: Box<dyn Fn(serde_json::Value) -> Result<String, String> + Send + Sync>,
+}
+
+impl ToolDefinition {
+    /// Creates a new tool definition.
+    ///
+    /// - `name`: identifier used by the model.
+    /// - `description`: explains what the tool does.
+    /// - `parameters`: schema for the tool's input arguments.
+    /// - `handler`: closure called when the model invokes the tool.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Schema,
+        handler: impl Fn(serde_json::Value) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+            handler: Box::new(handler),
+        }
+    }
+}
+
+impl std::fmt::Debug for ToolDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolDefinition")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Internal context that holds tool handlers. A raw pointer to this is passed to Swift
+/// as `tool_ctx` and lives for the full `Session` lifetime via `Arc`.
+#[cfg(foundation_models_bridge)]
+struct ToolsContext {
+    tools: Vec<(String, Box<dyn Fn(serde_json::Value) -> Result<String, String> + Send + Sync>)>,
 }
 
 // ─── Availability ──────────────────────────────────────────────────────────────
@@ -267,12 +499,10 @@ pub async fn respond_with_options(
 pub struct Session {
     #[cfg(foundation_models_bridge)]
     handle: *mut c_void,
-}
-
-impl std::fmt::Debug for Session {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Session").finish_non_exhaustive()
-    }
+    /// Keeps the tool handlers alive for the full session lifetime.
+    /// A raw pointer to the Arc payload is passed to Swift as `tool_ctx`.
+    #[cfg(foundation_models_bridge)]
+    _tools: Option<Arc<ToolsContext>>,
 }
 
 // Safety: The underlying Swift LanguageModelSession is designed for concurrent
@@ -280,6 +510,12 @@ impl std::fmt::Debug for Session {
 // from Rust — we only pass it to C-exported Swift functions.
 unsafe impl Send for Session {}
 unsafe impl Sync for Session {}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session").finish_non_exhaustive()
+    }
+}
 
 impl Session {
     /// Creates a new session with no system instructions.
@@ -302,11 +538,65 @@ impl Session {
             if handle.is_null() {
                 return Err(Error::Unavailable(UnavailabilityReason::Unknown));
             }
-            Ok(Self { handle })
+            Ok(Self { handle, _tools: None })
         }
         #[cfg(not(foundation_models_bridge))]
         {
             let _ = instructions;
+            Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
+        }
+    }
+
+    /// Creates a session pre-loaded with the given tools.
+    ///
+    /// The model will use these tools automatically when appropriate during `respond` calls.
+    /// Tool names must be unique within the session.
+    pub fn with_tools(instructions: &str, tools: Vec<ToolDefinition>) -> Result<Self, Error> {
+        availability().map_err(Error::Unavailable)?;
+
+        #[cfg(foundation_models_bridge)]
+        {
+            // Serialize tool definitions for Swift.
+            let tool_descs: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "properties": t.parameters.properties,
+                    })
+                })
+                .collect();
+            let tools_json = serde_json::to_string(&tool_descs)?;
+
+            let tools_ctx = Arc::new(ToolsContext {
+                tools: tools
+                    .into_iter()
+                    .map(|t| (t.name, t.handler))
+                    .collect(),
+            });
+            // Pass the raw Arc payload pointer to Swift. The Arc keeps it alive.
+            let tool_ctx_ptr = Arc::as_ptr(&tools_ctx) as *mut c_void;
+
+            let c_instructions = CString::new(instructions)?;
+            let c_tools_json = CString::new(tools_json)?;
+
+            let handle = unsafe {
+                fm_session_create_with_tools(
+                    c_instructions.as_ptr(),
+                    c_tools_json.as_ptr(),
+                    tool_ctx_ptr,
+                    tool_dispatch,
+                )
+            };
+            if handle.is_null() {
+                return Err(Error::Unavailable(UnavailabilityReason::Unknown));
+            }
+            Ok(Self { handle, _tools: Some(tools_ctx) })
+        }
+        #[cfg(not(foundation_models_bridge))]
+        {
+            let _ = (instructions, tools);
             Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
         }
     }
@@ -352,6 +642,62 @@ impl Session {
         #[cfg(not(foundation_models_bridge))]
         {
             let _ = (prompt, options);
+            Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
+        }
+    }
+
+    /// Sends a prompt and deserialises the response into `T` using the provided schema.
+    ///
+    /// The model generates output conforming to `schema` and this method deserialises it.
+    /// Derive [`serde::Deserialize`] on `T` and ensure the field names match the schema
+    /// property names exactly.
+    pub async fn respond_as<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Schema,
+    ) -> Result<T, Error> {
+        self.respond_as_with_options(prompt, schema, &GenerationOptions::default())
+            .await
+    }
+
+    /// Like [`respond_as`][Session::respond_as] but allows tuning generation.
+    pub async fn respond_as_with_options<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Schema,
+        options: &GenerationOptions,
+    ) -> Result<T, Error> {
+        options.validate()?;
+
+        #[cfg(foundation_models_bridge)]
+        {
+            let (tx, rx) = oneshot::channel::<Result<String, String>>();
+            let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+            let c_prompt = CString::new(prompt)?;
+            let schema_json = serde_json::to_string(schema)?;
+            let c_schema_json = CString::new(schema_json)?;
+
+            unsafe {
+                fm_session_respond_structured(
+                    self.handle,
+                    c_prompt.as_ptr(),
+                    c_schema_json.as_ptr(),
+                    options.ffi_temperature(),
+                    options.ffi_max_tokens(),
+                    ctx,
+                    respond_callback,
+                );
+            }
+
+            let json = rx
+                .await
+                .map_err(|_| Error::Generation("session was dropped before responding".into()))?
+                .map_err(Error::Generation)?;
+            Ok(serde_json::from_str(&json)?)
+        }
+        #[cfg(not(foundation_models_bridge))]
+        {
+            let _ = (prompt, schema, options);
             Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
         }
     }
@@ -446,14 +792,15 @@ impl Stream for ResponseStream {
 
 // ─── FFI callbacks ─────────────────────────────────────────────────────────────
 
-/// Callback for single-shot respond. Called exactly once by Swift.
+/// Callback for single-shot respond and structured respond. Called exactly once by Swift.
 #[cfg(foundation_models_bridge)]
 extern "C" fn respond_callback(
     ctx: *mut c_void,
     result: *const c_char,
     error: *const c_char,
 ) {
-    // Safety: ctx is always a Box<oneshot::Sender<...>> allocated in respond_with_options.
+    // Safety: ctx is always a Box<oneshot::Sender<...>> allocated in respond_with_options
+    // or respond_as_with_options.
     let tx = unsafe { Box::from_raw(ctx as *mut oneshot::Sender<Result<String, String>>) };
 
     if !error.is_null() {
@@ -465,7 +812,7 @@ extern "C" fn respond_callback(
     }
 }
 
-/// Internal state for a streaming request; owned by the Swift Task via a raw pointer.
+/// Internal state for a streaming request; owned by Swift via raw pointer until stream_done_callback.
 #[cfg(foundation_models_bridge)]
 struct StreamContext {
     tx: mpsc::UnboundedSender<Result<String, String>>,
@@ -492,6 +839,54 @@ extern "C" fn stream_done_callback(ctx: *mut c_void, error: *const c_char) {
         stream_ctx.tx.unbounded_send(Err(msg)).ok();
     }
     // stream_ctx drops here, closing the channel and ending the ResponseStream.
+}
+
+/// Dispatches a tool call from Swift to the appropriate Rust handler in `ToolsContext`.
+/// Calls `result_cb(result_ctx, result, null)` or `result_cb(result_ctx, null, error)`.
+#[cfg(foundation_models_bridge)]
+extern "C" fn tool_dispatch(
+    ctx: *mut c_void,
+    name_ptr: *const c_char,
+    args_ptr: *const c_char,
+    result_ctx: *mut c_void,
+    result_cb: extern "C" fn(*mut c_void, *const c_char, *const c_char),
+) {
+    // Safety: ctx is Arc::as_ptr(&tools_ctx) cast to *mut c_void; the Arc outlives this call.
+    let tools = unsafe { &*(ctx as *const ToolsContext) };
+    let name = unsafe { CStr::from_ptr(name_ptr).to_string_lossy() };
+    let args_str = unsafe { CStr::from_ptr(args_ptr).to_string_lossy() };
+
+    let args: serde_json::Value = match serde_json::from_str(&args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("invalid tool args JSON: {e}");
+            if let Ok(c) = CString::new(msg) {
+                result_cb(result_ctx, null(), c.as_ptr());
+            }
+            return;
+        }
+    };
+
+    match tools.tools.iter().find(|(n, _)| n == name.as_ref()) {
+        Some((_, handler)) => match handler(args) {
+            Ok(result) => {
+                if let Ok(c) = CString::new(result) {
+                    result_cb(result_ctx, c.as_ptr(), null());
+                }
+            }
+            Err(err) => {
+                if let Ok(c) = CString::new(err) {
+                    result_cb(result_ctx, null(), c.as_ptr());
+                }
+            }
+        },
+        None => {
+            let msg = format!("unknown tool: {name}");
+            if let Ok(c) = CString::new(msg) {
+                result_cb(result_ctx, null(), c.as_ptr());
+            }
+        }
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -533,10 +928,7 @@ mod tests {
     fn test_options_invalid_temperature() {
         for temp in [-0.1_f64, 2.001, f64::INFINITY, f64::NAN] {
             let opts = GenerationOptions { temperature: Some(temp), ..Default::default() };
-            assert!(
-                opts.validate().is_err(),
-                "temperature {temp} should be invalid"
-            );
+            assert!(opts.validate().is_err(), "temperature {temp} should be invalid");
         }
     }
 
@@ -556,6 +948,38 @@ mod tests {
         }
         let result = futures_executor::block_on(respond("hello\0world"));
         assert!(matches!(result, Err(Error::NullByte(_))));
+    }
+
+    #[test]
+    fn test_schema_builder() {
+        let schema = Schema::new("Point")
+            .description("A 2D point")
+            .property(SchemaProperty::new("x", SchemaPropertyType::Double).description("X axis"))
+            .property(SchemaProperty::new("y", SchemaPropertyType::Double));
+        assert_eq!(schema.name, "Point");
+        assert_eq!(schema.properties.len(), 2);
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(json.contains("\"x\""));
+        assert!(json.contains("\"double\""));
+    }
+
+    #[test]
+    fn test_tool_definition_builder() {
+        let tool = ToolDefinition::new(
+            "add",
+            "Add two numbers",
+            Schema::new("AddArgs")
+                .property(SchemaProperty::new("a", SchemaPropertyType::Double))
+                .property(SchemaProperty::new("b", SchemaPropertyType::Double)),
+            |args| {
+                let a = args["a"].as_f64().unwrap_or(0.0);
+                let b = args["b"].as_f64().unwrap_or(0.0);
+                Ok(format!("{}", a + b))
+            },
+        );
+        assert_eq!(tool.name, "add");
+        let result = (tool.handler)(serde_json::json!({"a": 3.0, "b": 4.0}));
+        assert_eq!(result.unwrap(), "7");
     }
 
     // ── Integration tests (require Apple Intelligence) ─────────────────────────
@@ -584,10 +1008,7 @@ mod tests {
             &opts,
         ))
         .expect("respond_with_options failed");
-        assert!(
-            r.to_lowercase().contains("paris"),
-            "expected Paris in: {r:?}"
-        );
+        assert!(r.to_lowercase().contains("paris"), "expected Paris in: {r:?}");
     }
 
     #[test]
@@ -610,8 +1031,6 @@ mod tests {
         let session = Session::new().expect("Session::new failed");
         let stream = session.stream("Count: one two three").expect("stream failed");
 
-        // Collect all chunks — block_on_stream drives the stream synchronously;
-        // it cannot be called from inside another block_on.
         let chunks: Vec<String> = futures_executor::block_on_stream(stream)
             .map(|r| r.expect("stream item was error"))
             .collect();
@@ -619,5 +1038,77 @@ mod tests {
         assert!(!chunks.is_empty(), "stream produced no chunks");
         let full = chunks.join("");
         assert!(!full.is_empty(), "concatenated response was empty");
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
+    fn test_structured_generation() {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct MathAnswer {
+            value: f64,
+            explanation: String,
+        }
+
+        let session = Session::new().expect("Session::new failed");
+        let schema = Schema::new("MathAnswer")
+            .description("A numeric answer with a brief explanation")
+            .property(
+                SchemaProperty::new("value", SchemaPropertyType::Double)
+                    .description("The numeric result"),
+            )
+            .property(
+                SchemaProperty::new("explanation", SchemaPropertyType::String)
+                    .description("One-sentence explanation"),
+            );
+
+        let answer: MathAnswer =
+            futures_executor::block_on(session.respond_as("What is 6 × 7?", &schema))
+                .expect("respond_as failed");
+
+        assert!(
+            (answer.value - 42.0).abs() < 0.5,
+            "expected 42, got {}",
+            answer.value
+        );
+        assert!(!answer.explanation.is_empty(), "explanation was empty");
+    }
+
+    #[test]
+    #[ignore = "requires Apple Intelligence"]
+    fn test_tool_calling() {
+        let tool = ToolDefinition::new(
+            "add_numbers",
+            "Add two numbers together and return the sum",
+            Schema::new("AddArgs")
+                .property(
+                    SchemaProperty::new("a", SchemaPropertyType::Double)
+                        .description("First number"),
+                )
+                .property(
+                    SchemaProperty::new("b", SchemaPropertyType::Double)
+                        .description("Second number"),
+                ),
+            |args| {
+                let a = args["a"].as_f64().unwrap_or(0.0);
+                let b = args["b"].as_f64().unwrap_or(0.0);
+                Ok(format!("{}", a + b))
+            },
+        );
+
+        let session = Session::with_tools(
+            "You are a calculator. Use the add_numbers tool when asked to add.",
+            vec![tool],
+        )
+        .expect("Session::with_tools failed");
+
+        let response = futures_executor::block_on(session.respond("What is 15 + 27?"))
+            .expect("respond failed");
+
+        assert!(
+            response.contains("42"),
+            "expected 42 in response: {response:?}"
+        );
     }
 }

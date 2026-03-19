@@ -26,6 +26,8 @@ name = "rusty_foundationmodels"
 thiserror = "2"
 futures-core = "0.3"
 futures-channel = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 futures-executor = "0.3"

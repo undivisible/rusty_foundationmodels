@@ -68,6 +68,57 @@ while let Some(chunk) = stream.next().await {
 println!();
 ```
 
+### Structured generation
+
+Describe the shape of the output with a `Schema` and the model returns a value that deserialises into your type:
+
+```rust
+use rusty_foundationmodels::{Session, Schema, SchemaProperty, SchemaPropertyType};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Capital {
+    city: String,
+    country: String,
+    population: i64,
+}
+
+let session = Session::new()?;
+let schema = Schema::new("Capital", "A country capital")
+    .property(SchemaProperty::new("city", SchemaPropertyType::String).description("City name"))
+    .property(SchemaProperty::new("country", SchemaPropertyType::String).description("Country name"))
+    .property(SchemaProperty::new("population", SchemaPropertyType::Integer).description("Approximate population"));
+
+let capital: Capital = session.respond_as("What is the capital of France?", &schema).await?;
+println!("{} is in {} with ~{} people", capital.city, capital.country, capital.population);
+```
+
+### Tool calling
+
+Define Rust functions that the model can invoke during generation:
+
+```rust
+use rusty_foundationmodels::{Session, Schema, SchemaProperty, SchemaPropertyType, ToolDefinition};
+use serde_json::Value;
+
+let tools = vec![
+    ToolDefinition::new(
+        "get_weather",
+        "Return current weather for a city",
+        Schema::new("WeatherArgs", "Arguments for get_weather")
+            .property(SchemaProperty::new("city", SchemaPropertyType::String).description("City name")),
+    )
+    .handler(|args: Value| {
+        let city = args["city"].as_str().unwrap_or("unknown");
+        Ok(format!("{city}: 22°C, sunny"))
+    }),
+];
+
+let mut session = Session::with_tools(tools, None)?;
+let response = session.respond("What is the weather in Tokyo?").await?;
+println!("{response}");
+```
+
 ### Generation options
 
 ```rust
