@@ -1,0 +1,32 @@
+[package]
+name = "rusty_foundationmodels"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Safe Rust bindings for Apple's FoundationModels on-device AI (Apple Intelligence)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/undivisible/rusty_foundationmodels"
+homepage = "https://github.com/undivisible/rusty_foundationmodels"
+documentation = "https://docs.rs/rusty_foundationmodels"
+keywords = ["apple", "ai", "macos", "foundation-models", "llm"]
+categories = ["api-bindings", "asynchronous"]
+readme = "README.md"
+include = [
+    "src/**",
+    "bridge.swift",
+    "build.rs",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
+
+[lib]
+name = "rusty_foundationmodels"
+
+[dependencies]
+thiserror = "2"
+futures-core = "0.3"
+futures-channel = "0.3"
+
+[dev-dependencies]
+futures-executor = "0.3"
