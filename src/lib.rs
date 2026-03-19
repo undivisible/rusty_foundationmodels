@@ -607,17 +607,14 @@ mod tests {
     #[test]
     #[ignore = "requires Apple Intelligence"]
     fn test_streaming_yields_chunks() {
-        use futures_executor::block_on;
-
         let session = Session::new().expect("Session::new failed");
         let stream = session.stream("Count: one two three").expect("stream failed");
 
-        // Collect all chunks
-        let chunks: Vec<String> = block_on(async {
-            futures_executor::block_on_stream(stream)
-                .map(|r| r.expect("stream item was error"))
-                .collect()
-        });
+        // Collect all chunks — block_on_stream drives the stream synchronously;
+        // it cannot be called from inside another block_on.
+        let chunks: Vec<String> = futures_executor::block_on_stream(stream)
+            .map(|r| r.expect("stream item was error"))
+            .collect();
 
         assert!(!chunks.is_empty(), "stream produced no chunks");
         let full = chunks.join("");

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Safe Rust bindings for Apple's FoundationModels on-device AI (Apple Intelligence)"
-license = "MIT OR Apache-2.0"
+license = "MPL-2.0"
 repository = "https://github.com/undivisible/rusty_foundationmodels"
 homepage = "https://github.com/undivisible/rusty_foundationmodels"
 documentation = "https://docs.rs/rusty_foundationmodels"
@@ -16,8 +16,7 @@ include = [
     "bridge.swift",
     "build.rs",
     "README.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
+    "LICENSE",
 ]
 
 [lib]

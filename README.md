@@ -116,11 +116,6 @@ If `xcrun` is not found or compilation fails (e.g. on non-macOS hosts or without
 
 ## License
 
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under the [Mozilla Public License 2.0](LICENSE).
 
 [FoundationModels]: https://developer.apple.com/documentation/foundationmodels

@@ -53,7 +53,6 @@ cargo clippy -- -D warnings
 ## Publishing checklist
 
 - [ ] Bump version in `Cargo.toml`
-- [ ] Update `CHANGELOG.md` (if present)
-- [ ] `cargo test` passes cleanly
+- [ ] `cargo test -- --include-ignored` passes (requires Apple Intelligence hardware)
 - [ ] `cargo doc --open` renders correctly
 - [ ] `cargo publish --dry-run` succeeds
