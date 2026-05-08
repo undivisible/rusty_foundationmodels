@@ -1,5 +1,12 @@
 # rusty_foundationmodels
 
+> [!WARNING]
+> This repository has been archived and is no longer maintained.
+>
+> Development has moved to [`rs_ai`](https://github.com/undivisible/rs_ai), which contains the latest FoundationModels (and other localai like Phi Silica on Windows and Gemini Nano on Android) support, APIs, fixes, and ongoing work.
+>
+> Please update your dependencies and use `rs_ai` for all new projects.
+
 Safe Rust bindings for Apple's [FoundationModels] on-device AI framework (Apple Intelligence).
 
 Run a local ≈3B-parameter language model entirely on-device — no network requests, no API keys, no data leaving the device.
