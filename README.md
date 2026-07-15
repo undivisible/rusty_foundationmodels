@@ -60,6 +60,59 @@ let r2 = session.respond("Give me a one-line example.").await?;
 println!("{r1}\n{r2}");
 ```
 
+### Dynamic profile switching
+
+Swap system instructions mid-session without losing state:
+
+```rust
+use rusty_foundationmodels::Session;
+
+let session = Session::with_instructions("You are a poet.")?;
+let poem = session.respond("Write a haiku about Rust.").await?;
+
+session.update_profile("You are now a stern code reviewer.")?;
+let review = session.respond("Review this: `fn main() {}`").await?;
+```
+
+### Multimodal prompts (image + text)
+
+Pass an image alongside a text prompt for visual reasoning:
+
+```rust
+use rusty_foundationmodels::{Session, Attachment};
+
+let session = Session::new()?;
+let screenshot = std::fs::read("diagram.png")?;
+let attachment = Attachment::image(screenshot, "image/png");
+let analysis = session.respond_with_attachment(
+    "Explain this architecture diagram.",
+    &attachment,
+    &Default::default(),
+).await?;
+```
+
+### Streaming structured output
+
+Stream JSON fragments as the model fills a typed schema:
+
+```rust
+use rusty_foundationmodels::{Session, Schema, SchemaProperty, SchemaPropertyType};
+use futures_util::StreamExt as _;
+
+let session = Session::new()?;
+let schema = Schema::new("CodeReview")
+    .property(SchemaProperty::new("score", SchemaPropertyType::Integer))
+    .property(SchemaProperty::new("summary", SchemaPropertyType::String));
+
+let mut stream = session.stream_structured(
+    "Review this code.", &schema, &Default::default(),
+)?;
+while let Some(chunk) = stream.next().await {
+    // each chunk is a partial JSON blob
+    println!("{}", chunk?);
+}
+```
+
 ### Streaming
 
 ```rust

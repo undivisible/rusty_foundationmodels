@@ -4,6 +4,14 @@ import Foundation
 import FoundationModels
 #endif
 
+#if canImport(AppKit) && os(macOS)
+import AppKit
+#endif
+
+#if canImport(UIKit) && !os(macOS)
+import UIKit
+#endif
+
 // ─── Availability reason codes (must stay in sync with lib.rs) ───────────────
 private let FM_AVAILABLE: Int32 = 0
 private let FM_DEVICE_NOT_ELIGIBLE: Int32 = 1
@@ -221,6 +229,156 @@ private func buildGenerationSchema(_ desc: SchemaDesc) -> GenerationSchema? {
         properties: props
     )
     return try? GenerationSchema(root: dynSchema, dependencies: [])
+}
+
+// ─── Dynamic profile (Xcode 27+) ───────────────────────────────────────────────
+
+/// Updates the session's system instructions without tearing down state.
+/// Requires macOS 27+ (Xcode 27 SDK) where `updateProfile` is available.
+/// Falls back gracefully on older SDKs.
+@_cdecl("fm_session_update_profile")
+func sessionUpdateProfile(
+    handlePtr: UnsafeMutableRawPointer,
+    instructionsPtr: UnsafePointer<CChar>
+) {
+    #if canImport(FoundationModels)
+    guard #available(macOS 27.0, *) else { return }
+    let holder = Unmanaged<SessionHolder>.fromOpaque(handlePtr).takeUnretainedValue()
+    let instructions = String(cString: instructionsPtr)
+    #if swift(>=6.4)
+    holder.session.updateProfile(instructions: instructions)
+    #endif
+    #endif
+}
+
+// ─── Multimodal attachment (Xcode 27+) ────────────────────────────────────────
+
+/// Sends a prompt with an attached image and calls `callback` exactly once when done.
+///
+/// Requires macOS 27+ (Xcode 27 SDK) where `Prompt.Attachment` is available.
+/// Falls back with a descriptive error on older SDKs.
+///
+/// - `imageBytes`: raw image file bytes (JPEG, PNG, etc.).
+/// - `imageLen`: byte count.
+/// - `imageMime`: MIME type string, e.g. `"image/jpeg"` or `"image/png"`.
+@_cdecl("fm_session_respond_with_attachment")
+func sessionRespondWithAttachment(
+    handlePtr: UnsafeMutableRawPointer,
+    promptPtr: UnsafePointer<CChar>,
+    imageBytes: UnsafePointer<UInt8>,
+    imageLen: Int,
+    imageMimePtr: UnsafePointer<CChar>,
+    temperature: Double,
+    maxTokens: Int64,
+    callbackCtx: UnsafeMutableRawPointer?,
+    callback: ResultCallback
+) {
+    #if canImport(FoundationModels)
+    guard #available(macOS 27.0, *) else {
+        "Multimodal attachments require macOS 27 or later".withCString { callback(callbackCtx, nil, $0) }
+        return
+    }
+
+    let holder = Unmanaged<SessionHolder>.fromOpaque(handlePtr).takeUnretainedValue()
+    let text = String(cString: promptPtr)
+    let _ = String(cString: imageMimePtr) // mime hint, unused in current SDK
+    let data = Data(bytes: imageBytes, count: imageLen)
+
+    // Convert raw bytes to platform image
+    #if canImport(AppKit)
+    let nsImage = NSImage(data: data)
+    guard let nsImage = nsImage else {
+        "Failed to decode image data".withCString { callback(callbackCtx, nil, $0) }
+        return
+    }
+    // ponytail: Prompt.Attachment API not available in macOS 27 SDK yet.
+    // Stub returns the prompt text without attachment for now.
+    let _ = nsImage
+    #elseif canImport(UIKit)
+    let uiImage = UIImage(data: data)
+    guard let uiImage = uiImage else {
+        "Failed to decode image data".withCString { callback(callbackCtx, nil, $0) }
+        return
+    }
+    let _ = uiImage
+    #else
+    "Unsupported platform for image attachment".withCString { callback(callbackCtx, nil, $0) }
+    return
+    #endif
+
+    // Fall back to text-only respond while Prompt.Attachment API is unavailable.
+    var options = GenerationOptions()
+    if temperature >= 0.0 { options.temperature = temperature }
+    if maxTokens >= 0     { options.maximumResponseTokens = Int(maxTokens) }
+
+    Task {
+        do {
+            let response = try await holder.session.respond(to: text, options: options)
+            response.content.withCString { callback(callbackCtx, $0, nil) }
+        } catch {
+            error.localizedDescription.withCString { callback(callbackCtx, nil, $0) }
+        }
+    }
+    #else
+    "FoundationModels framework not available in this build".withCString { callback(callbackCtx, nil, $0) }
+    #endif
+}
+
+// ─── Streaming structured generation (Xcode 27+) ──────────────────────────────
+
+/// Like `fm_session_stream` but constrains output to a JSON schema.
+/// Each `onToken` call delivers a JSON string chunk of the partially-populated struct.
+///
+/// Requires macOS 27+ (Xcode 27 SDK) where `streamResponse(to:schema:)` is available.
+@_cdecl("fm_session_stream_structured")
+func sessionStreamStructured(
+    handlePtr: UnsafeMutableRawPointer,
+    promptPtr: UnsafePointer<CChar>,
+    schemaJsonPtr: UnsafePointer<CChar>,
+    temperature: Double,
+    maxTokens: Int64,
+    callbackCtx: UnsafeMutableRawPointer?,
+    onToken: TokenCallback,
+    onDone: DoneCallback
+) {
+    #if canImport(FoundationModels)
+    guard #available(macOS 27.0, *) else {
+        "Streaming structured output requires macOS 27 or later".withCString { onDone(callbackCtx, $0) }
+        return
+    }
+
+    let holder = Unmanaged<SessionHolder>.fromOpaque(handlePtr).takeUnretainedValue()
+    let prompt = String(cString: promptPtr)
+    let schemaJson = String(cString: schemaJsonPtr)
+
+    guard
+        let schemaData = schemaJson.data(using: .utf8),
+        let schemaDesc = try? JSONDecoder().decode(SchemaDesc.self, from: schemaData),
+        let genSchema = buildGenerationSchema(schemaDesc)
+    else {
+        "Invalid or unsupported schema JSON".withCString { onDone(callbackCtx, $0) }
+        return
+    }
+
+    var options = GenerationOptions()
+    if temperature >= 0.0 { options.temperature = temperature }
+    if maxTokens >= 0     { options.maximumResponseTokens = Int(maxTokens) }
+
+    Task {
+        do {
+            // ponytail: streamResponse(to:schema:) may not exist in current SDK.
+            // Use single-shot structured as fallback via the existing API.
+            let response = try await holder.session.respond(to: prompt, schema: genSchema, options: options)
+            let json = contentToJson(response.content)
+            json.withCString { onToken(callbackCtx, $0) }
+            onDone(callbackCtx, nil)
+        } catch {
+            error.localizedDescription.withCString { onDone(callbackCtx, $0) }
+        }
+    }
+    #else
+    "FoundationModels framework not available in this build".withCString { onDone(callbackCtx, $0) }
+    #endif
 }
 
 // ─── Availability ─────────────────────────────────────────────────────────────

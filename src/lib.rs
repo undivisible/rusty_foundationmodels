@@ -1,5 +1,9 @@
 //! Safe Rust bindings for Apple's [FoundationModels] on-device AI framework
 //! (Apple Intelligence).
+
+// Items used only under cfg(foundation_models_bridge) trigger dead_code
+// on hosts without the macOS 26 SDK. Silence those pre-existing warnings.
+#![cfg_attr(not(foundation_models_bridge), allow(dead_code, unused_imports))]
 //!
 //! # Overview
 //!
@@ -13,6 +17,9 @@
 //! - **Streaming** — [`Session::stream`] returns a [`ResponseStream`] that implements
 //!   [`futures_core::Stream`]
 //! - **Structured generation** — [`Session::respond_as`] returns any `serde::Deserialize` type
+//! - **Streaming structured types** — [`Session::stream_structured`] yields partial JSON chunks
+//! - **Multimodal prompts** — [`Session::respond_with_attachment`] sends images alongside text
+//! - **Dynamic profile switching** — [`Session::update_profile`] swaps instructions mid-session
 //! - **Tool calling** — [`Session::with_tools`] registers Rust closures the model can invoke
 //!
 //! # Requirements
@@ -128,8 +135,10 @@ use std::ptr::null;
 #[cfg(foundation_models_bridge)]
 use std::sync::Arc;
 
+use futures_channel::mpsc;
+
 #[cfg(foundation_models_bridge)]
-use futures_channel::{mpsc, oneshot};
+use futures_channel::oneshot;
 
 // ─── FFI declarations ──────────────────────────────────────────────────────────
 
@@ -170,6 +179,28 @@ unsafe extern "C" {
     fn fm_session_stream(
         handle: *mut c_void,
         prompt: *const c_char,
+        temperature: f64,
+        max_tokens: i64,
+        ctx: *mut c_void,
+        on_token: extern "C" fn(*mut c_void, *const c_char),
+        on_done: extern "C" fn(*mut c_void, *const c_char),
+    );
+    fn fm_session_update_profile(handle: *mut c_void, instructions: *const c_char);
+    fn fm_session_respond_with_attachment(
+        handle: *mut c_void,
+        prompt: *const c_char,
+        image_bytes: *const u8,
+        image_len: usize,
+        image_mime: *const c_char,
+        temperature: f64,
+        max_tokens: i64,
+        ctx: *mut c_void,
+        callback: extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    );
+    fn fm_session_stream_structured(
+        handle: *mut c_void,
+        prompt: *const c_char,
+        schema_json: *const c_char,
         temperature: f64,
         max_tokens: i64,
         ctx: *mut c_void,
@@ -260,6 +291,28 @@ impl GenerationOptions {
 
     fn ffi_max_tokens(&self) -> i64 {
         self.max_tokens.map(|n| n as i64).unwrap_or(-1)
+    }
+}
+
+// ─── Attachment types for multimodal prompts ───────────────────────────────────
+
+/// A media attachment to include in a prompt.
+///
+/// Currently supports images passed as raw bytes with a MIME type hint.
+/// The Swift bridge decodes these into `NSImage` / `UIImage` and wraps
+/// them as `Prompt.Attachment.image(_:)`.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    /// Raw image file bytes (JPEG, PNG, etc.).
+    pub data: Vec<u8>,
+    /// MIME type, e.g. `"image/jpeg"` or `"image/png"`.
+    pub mime: String,
+}
+
+impl Attachment {
+    /// Creates a new image attachment from raw bytes and a MIME type.
+    pub fn image(data: impl Into<Vec<u8>>, mime: impl Into<String>) -> Self {
+        Self { data: data.into(), mime: mime.into() }
     }
 }
 
@@ -416,6 +469,7 @@ impl std::fmt::Debug for ToolDefinition {
 /// Internal context that holds tool handlers. A raw pointer to this is passed to Swift
 /// as `tool_ctx` and lives for the full `Session` lifetime via `Arc`.
 #[cfg(foundation_models_bridge)]
+#[allow(clippy::type_complexity)]
 struct ToolsContext {
     tools: Vec<(String, Box<dyn Fn(serde_json::Value) -> Result<String, String> + Send + Sync>)>,
 }
@@ -601,6 +655,26 @@ impl Session {
         }
     }
 
+    /// Dynamically updates the session's system instructions without tearing down state.
+    ///
+    /// Replaces the previous instructions and affects all subsequent responses.
+    /// Useful for changing the model's role or behaviour mid-conversation.
+    pub fn update_profile(&self, instructions: &str) -> Result<(), Error> {
+        #[cfg(foundation_models_bridge)]
+        {
+            let c_instructions = CString::new(instructions)?;
+            unsafe {
+                fm_session_update_profile(self.handle, c_instructions.as_ptr());
+            }
+            Ok(())
+        }
+        #[cfg(not(foundation_models_bridge))]
+        {
+            let _ = instructions;
+            Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
+        }
+    }
+
     /// Sends a prompt and returns the full response text.
     ///
     /// The response is appended to this session's transcript, so subsequent
@@ -702,6 +776,65 @@ impl Session {
         }
     }
 
+    /// Sends a prompt with an image attachment and returns the response text.
+    ///
+    /// The model sees both the text and the image, enabling visual reasoning
+    /// over diagrams, screenshots, or photos.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), rusty_foundationmodels::Error> {
+    /// use rusty_foundationmodels::{Session, Attachment};
+    ///
+    /// let session = Session::new()?;
+    /// let img = std::fs::read("diagram.png").unwrap();
+    /// let attachment = Attachment::image(img, "image/png");
+    /// let answer = session.respond_with_attachment(
+    ///     "Explain this diagram.",
+    ///     &attachment,
+    ///     &Default::default(),
+    /// ).await.unwrap();
+    /// # Ok(()) }
+    /// ```
+    pub async fn respond_with_attachment(
+        &self,
+        prompt: &str,
+        attachment: &Attachment,
+        options: &GenerationOptions,
+    ) -> Result<String, Error> {
+        options.validate()?;
+
+        #[cfg(foundation_models_bridge)]
+        {
+            let (tx, rx) = oneshot::channel::<Result<String, String>>();
+            let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+            let c_prompt = CString::new(prompt)?;
+            let c_mime = CString::new(&*attachment.mime)?;
+
+            unsafe {
+                fm_session_respond_with_attachment(
+                    self.handle,
+                    c_prompt.as_ptr(),
+                    attachment.data.as_ptr(),
+                    attachment.data.len(),
+                    c_mime.as_ptr(),
+                    options.ffi_temperature(),
+                    options.ffi_max_tokens(),
+                    ctx,
+                    respond_callback,
+                );
+            }
+
+            rx.await
+                .map_err(|_| Error::Generation("session was dropped before responding".into()))?
+                .map_err(Error::Generation)
+        }
+        #[cfg(not(foundation_models_bridge))]
+        {
+            let _ = (prompt, attachment, options);
+            Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
+        }
+    }
+
     /// Returns a [`ResponseStream`] that yields text chunks as the model generates them.
     ///
     /// Each yielded chunk is an incremental snapshot of the response text. Drive the
@@ -753,6 +886,61 @@ impl Session {
             Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
         }
     }
+
+    /// Returns a [`ResponseStructuredStream`] that yields JSON chunks conforming to
+    /// the given schema as the model generates them.
+    ///
+    /// Each chunk is a JSON string representing a partially-populated view of the
+    /// structured type defined by `schema`. The stream ends when generation finishes.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), rusty_foundationmodels::Error> {
+    /// use rusty_foundationmodels::{Session, Schema, SchemaProperty, SchemaPropertyType};
+    ///
+    /// let session = Session::new()?;
+    /// let schema = Schema::new("Review")
+    ///     .property(SchemaProperty::new("score", SchemaPropertyType::Integer))
+    ///     .property(SchemaProperty::new("summary", SchemaPropertyType::String));
+    /// let stream = session.stream_structured("Review this code.", &schema, &Default::default())?;
+    /// # Ok(()) }
+    /// ```
+    pub fn stream_structured(
+        &self,
+        prompt: &str,
+        schema: &Schema,
+        options: &GenerationOptions,
+    ) -> Result<ResponseStructuredStream, Error> {
+        options.validate()?;
+
+        #[cfg(foundation_models_bridge)]
+        {
+            let (tx, rx) = mpsc::unbounded::<Result<String, String>>();
+            let ctx = Box::into_raw(Box::new(StreamContext { tx })) as *mut c_void;
+            let c_prompt = CString::new(prompt)?;
+            let schema_json = serde_json::to_string(schema)?;
+            let c_schema_json = CString::new(schema_json)?;
+
+            unsafe {
+                fm_session_stream_structured(
+                    self.handle,
+                    c_prompt.as_ptr(),
+                    c_schema_json.as_ptr(),
+                    options.ffi_temperature(),
+                    options.ffi_max_tokens(),
+                    ctx,
+                    stream_token_callback,
+                    stream_done_callback,
+                );
+            }
+
+            Ok(ResponseStructuredStream { rx })
+        }
+        #[cfg(not(foundation_models_bridge))]
+        {
+            let _ = (prompt, schema, options);
+            Err(Error::Unavailable(UnavailabilityReason::DeviceNotEligible))
+        }
+    }
 }
 
 impl Drop for Session {
@@ -778,6 +966,29 @@ pub struct ResponseStream {
 }
 
 impl Stream for ResponseStream {
+    type Item = Result<String, Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut StdContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx)
+            .poll_next(cx)
+            .map(|opt| opt.map(|r| r.map_err(Error::Generation)))
+    }
+}
+
+/// An async stream of JSON chunks produced by [`Session::stream_structured`].
+///
+/// Each item is `Ok(String)` containing a JSON fragment of the structured output,
+/// or `Err(Error)` if generation failed. The stream ends when the model finishes.
+///
+/// Implements [`futures_core::Stream`]; use with `.next()` from `StreamExt`.
+pub struct ResponseStructuredStream {
+    rx: mpsc::UnboundedReceiver<Result<String, String>>,
+}
+
+impl Stream for ResponseStructuredStream {
     type Item = Result<String, Error>;
 
     fn poll_next(

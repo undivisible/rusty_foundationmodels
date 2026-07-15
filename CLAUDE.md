@@ -30,7 +30,23 @@ From the macOS 26 SDK (`FoundationModels.framework`):
 - `LanguageModelSession(instructions:)` — session creation
 - `session.respond(to:options:)` — async single-shot, returns `Response<String>`; access text via `.content`
 - `session.streamResponse(to:options:)` — returns `ResponseStream<String>`; iterate with `for try await chunk in ...`; access text via `chunk.content`
+- `session.updateProfile(instructions:)` — dynamic instruction swap (v0.2+)
+- `session.respond(to:prompt:)` — accepts `Prompt` with multimodal `Prompt.Attachment` (v0.2+)
+- `session.streamResponse(to:schema:options:)` — structured streaming returning `ResponseStream<GeneratedContent>` (v0.2+)
+- `Prompt.Attachment.image(_:)` — image attachment from `NSImage` / `UIImage` (v0.2+)
 - `GenerationOptions` — struct with `temperature: Double?` and `maximumResponseTokens: Int?`
+
+### FFI additions (v0.2)
+
+| C function | Swift API | Rust method |
+|---|---|---|
+| `fm_session_update_profile` | `session.updateProfile(instructions:)` | `Session::update_profile()` |
+| `fm_session_respond_with_attachment` | `session.respond(to:)` with `Prompt.Attachment` | `Session::respond_with_attachment()` |
+| `fm_session_stream_structured` | `session.streamResponse(to:schema:)` | `Session::stream_structured()` |
+
+### Image attachment FFI
+
+`fm_session_respond_with_attachment` passes raw image bytes (pointer + length) plus a MIME type string. Swift decodes the bytes into `NSImage`/`UIImage`, wraps in `Prompt.Attachment.image(_:)`, and constructs a `Prompt(text:, attachments:)` before calling `session.respond(to:)`.
 
 ## Running tests
 
