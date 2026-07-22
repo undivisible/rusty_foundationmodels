@@ -227,6 +227,6 @@ If `xcrun` is not found or compilation fails (e.g. on non-macOS hosts or without
 
 ## License
 
-Licensed under the [Mozilla Public License 2.0](LICENSE).
+Licensed under the ISC License. See [LICENSE](LICENSE) for details.
 
 [FoundationModels]: https://developer.apple.com/documentation/foundationmodels
