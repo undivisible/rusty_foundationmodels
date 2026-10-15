@@ -1,0 +1,3 @@
+
+# Exclude Shell from GitHub language statistics.
+*.sh linguist-detectable=false
